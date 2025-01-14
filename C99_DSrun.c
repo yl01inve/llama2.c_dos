@@ -1,19 +1,11 @@
 /* Inference for Llama-2 Transformer model in pure C */
-//rm a.out; gcc -std=c99 -pedantic ../run3.c -lm ;./a.out stories260K.bin -t 0.8 -n 256 -i "One day, Lily met a Shoggoth"
-//gcc run.c -lm -o run.exe;run.exe f260k.bin -t 0.8 -n 256 -i "One day, Lily met a Shoggoth"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
-#include <sys/time.h>
 #include <time.h>
 #include <math.h>
 #include <string.h>
-#include <fcntl.h>
-#include <stdint.h> 
-#include <unistd.h>
-
-int	fileno(FILE *_stream);
 
 // ----------------------------------------------------------------------------
 // Transformer model
@@ -71,8 +63,8 @@ typedef struct {
     TransformerWeights weights; // the weights of the model
     RunState state; // buffers for the "wave" of activations in the forward pass
     // some more state needed to properly clean up the memory mapping (sigh)
-    int fd; // file descriptor for memory mapping
-    float* data; // memory mapped data pointer
+    FILE* file; // file pointer for reading the checkpoint
+    float* data; // data pointer for the checkpoint
     ssize_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
@@ -110,101 +102,77 @@ void free_run_state(RunState* s) {
     free(s->value_cache);
 }
 
-void memory_map_weights(TransformerWeights *w, Config* p, FILE *file, int shared_weights) {
+void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
     int head_size = p->dim / p->n_heads;
     // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
     unsigned long long n_layers = p->n_layers;
-
-    // Read the token_embedding_table from the file
-    w->token_embedding_table = (float*) malloc(p->vocab_size * p->dim * sizeof(float));
-    fread(w->token_embedding_table, sizeof(float), p->vocab_size * p->dim, file);
-
-    // Read the other weights
-    w->rms_att_weight = (float*) malloc(n_layers * p->dim * sizeof(float));
-    fread(w->rms_att_weight, sizeof(float), n_layers * p->dim, file);
-
-    w->wq = (float*) malloc(n_layers * p->dim * (p->n_heads * head_size) * sizeof(float));
-    fread(w->wq, sizeof(float), n_layers * p->dim * (p->n_heads * head_size), file);
-
-    w->wk = (float*) malloc(n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float));
-    fread(w->wk, sizeof(float), n_layers * p->dim * (p->n_kv_heads * head_size), file);
-
-    w->wv = (float*) malloc(n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float));
-    fread(w->wv, sizeof(float), n_layers * p->dim * (p->n_kv_heads * head_size), file);
-
-    w->wo = (float*) malloc(n_layers * (p->n_heads * head_size) * p->dim * sizeof(float));
-    fread(w->wo, sizeof(float), n_layers * (p->n_heads * head_size) * p->dim, file);
-
-    w->rms_ffn_weight = (float*) malloc(n_layers * p->dim * sizeof(float));
-    fread(w->rms_ffn_weight, sizeof(float), n_layers * p->dim, file);
-
-    w->w1 = (float*) malloc(n_layers * p->dim * p->hidden_dim * sizeof(float));
-    fread(w->w1, sizeof(float), n_layers * p->dim * p->hidden_dim, file);
-
-    w->w2 = (float*) malloc(n_layers * p->hidden_dim * p->dim * sizeof(float));
-    fread(w->w2, sizeof(float), n_layers * p->hidden_dim * p->dim, file);
-
-    w->w3 = (float*) malloc(n_layers * p->dim * p->hidden_dim * sizeof(float));
-    fread(w->w3, sizeof(float), n_layers * p->dim * p->hidden_dim, file);
-
-    w->rms_final_weight = (float*) malloc(p->dim * sizeof(float));
-    fread(w->rms_final_weight, sizeof(float), p->dim, file);
-
-    // Skip the freq_cis_real and freq_cis_imag data
-    fseek(file, p->seq_len * head_size / 2 * sizeof(float), SEEK_CUR); // skip freq_cis_real
-    fseek(file, p->seq_len * head_size / 2 * sizeof(float), SEEK_CUR); // skip freq_cis_imag
-
-    // If shared_weights is true, use the same pointer for wcls, else read from file
-    if (shared_weights) {
-        w->wcls = w->token_embedding_table;
-    } else {
-        w->wcls = (float*) malloc(p->dim * sizeof(float));
-        fread(w->wcls, sizeof(float), p->dim, file);
-    }
+    w->token_embedding_table = ptr;
+    ptr += p->vocab_size * p->dim;
+    w->rms_att_weight = ptr;
+    ptr += n_layers * p->dim;
+    w->wq = ptr;
+    ptr += n_layers * p->dim * (p->n_heads * head_size);
+    w->wk = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wv = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wo = ptr;
+    ptr += n_layers * (p->n_heads * head_size) * p->dim;
+    w->rms_ffn_weight = ptr;
+    ptr += n_layers * p->dim;
+    w->w1 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim;
+    w->w2 = ptr;
+    ptr += n_layers * p->hidden_dim * p->dim;
+    w->w3 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim;
+    w->rms_final_weight = ptr;
+    ptr += p->dim;
+    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
+    ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
+    w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
-void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights, int* fd, float** data, ssize_t* file_size) {
-    FILE *file = fopen(checkpoint, "rb");
-    if (!file) { 
-        fprintf(stderr, "Couldn't open file %s\n", checkpoint); 
-        exit(EXIT_FAILURE); 
-    }
-
-    // Read the config header
-    if (fread(config, sizeof(Config), 1, file) != 1) { 
-        exit(EXIT_FAILURE); 
-    }
-
-    // Handle shared weights
+void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weights,
+                     FILE** file, float** data, ssize_t* file_size) {
+    *file = fopen(checkpoint, "rb");
+    if (!*file) { fprintf(stderr, "Couldn't open file %s\n", checkpoint); exit(EXIT_FAILURE); }
+    // read in the config header
+    if (fread(config, sizeof(Config), 1, *file) != 1) { exit(EXIT_FAILURE); }
+    // negative vocab size is hacky way of signaling unshared weights. bit yikes.
     int shared_weights = config->vocab_size > 0 ? 1 : 0;
     config->vocab_size = abs(config->vocab_size);
+    // figure out the file size
+    fseek(*file, 0, SEEK_END); // move file pointer to end of file
+    *file_size = ftell(*file); // get the file size, in bytes
+    fseek(*file, sizeof(Config), SEEK_SET); // move back to the start of the weights
 
-    // Memory map the Transformer weights into the data pointer
-    memory_map_weights(weights, config, file, shared_weights);
+    // allocate memory for the weights
+    *data = malloc(*file_size - sizeof(Config));
+    if (!*data) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
 
-    // Additional information about the file
-    fseek(file, 0, SEEK_END);
-    *file_size = ftell(file);
-    fseek(file, 0, SEEK_SET); // Reset file pointer back to the start
-    
-    // Open the file descriptor for further access (if needed)
-    *fd = fileno(file);
-    
-    fclose(file);
+    // read the weights into memory
+    if (fread(*data, 1, *file_size - sizeof(Config), *file) != (*file_size - sizeof(Config))) {
+        fprintf(stderr, "fread failed!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    float* weights_ptr = *data;
+    memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
-
 
 void build_transformer(Transformer *t, char* checkpoint_path) {
     // read in the Config and the Weights from the checkpoint
-    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
+    read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->file, &t->data, &t->file_size);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
 }
 
 void free_transformer(Transformer* t) {
-    // close the memory mapping
-    //if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
-    if (t->fd != -1) { close(t->fd); }
+    // close the file
+    if (t->file) { fclose(t->file); }
+    // free the data
+    if (t->data) { free(t->data); }
     // free the RunState buffers
     free_run_state(&t->state);
 }
@@ -251,6 +219,7 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     int i;
+    #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
@@ -312,6 +281,7 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // multihead attention. iterate over all heads
         int h;
+        #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
             // get the query vector for this head
             float* q = s->q + h * head_size;
@@ -480,7 +450,7 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     return res != NULL ? res->id : -1;
 }
 
-void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
+void encode(Tokenizer* t, char *text, char bos, char eos, int *tokens, int *n_tokens) {
     // encode the string text (input) into an upper-bound preallocated tokens[] array
     // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
     if (text == NULL) { fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE); }
@@ -747,10 +717,9 @@ int sample(Sampler* sampler, float* logits) {
 // ----------------------------------------------------------------------------
 // utilities: time
 
-int64_t time_in_ms() {
-    struct timeval time;
-    gettimeofday(&time, NULL);  // 获取当前时间
-    return (int64_t)time.tv_sec * 1000 + time.tv_usec / 1000;
+long time_in_ms() {
+    // return time in milliseconds, for benchmarking the model speed
+    return clock() * 1000 / CLOCKS_PER_SEC;
 }
 
 // ----------------------------------------------------------------------------
@@ -842,7 +811,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     int user_idx;
 
     // start the main loop
-    int8_t user_turn = 1; // user starts
+    char user_turn = 1; // user starts
     int next;        // will store the next token in the sequence
     int token;       // stores the current token to feed into the transformer
     int prev_token;
@@ -937,7 +906,7 @@ int main(int argc, char *argv[]) {
 
     // default parameters
     char *checkpoint_path = NULL;  // e.g. out/model.bin
-    char *tokenizer_path = "token.bin";
+    char *tokenizer_path = "TOKEN.bin";
     float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     int steps = 256;            // number of steps to run for
